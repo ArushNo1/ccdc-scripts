@@ -1,0 +1,5 @@
+service: audit-services
+description: Read-only look at what runs, what listens and what starts at boot. Changes nothing
+steps:
+  - run: services/audit-services
+    timeout: 120

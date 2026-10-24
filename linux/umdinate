@@ -1,0 +1,444 @@
+#!/bin/sh
+# Wrapper around ./coordinate: picks credentials from the hosts file and runs a
+# service (a list of steps in <name>.yml, a path from linux/) on one or more hosts.
+#
+#   ./umdinate -t <host|h1,h2|all> <playbook> [-r] [-n]
+#   ./umdinate -l
+#
+#   <playbook> is the bare name of playbooks/<name>.yml (harden-ssh).
+#   -l  list the playbooks with their description
+#
+#   -t  target: a name or ip from the hosts file, a comma list, or "all"
+#   -r  harden mode: escalate to root on the target (coordinate -S).
+#       Without it the scripts run unprivileged, which makes them audit only.
+#       Only scripts with status tested or stable run as root; set
+#       UMDINATE_UNTESTED=1 to run others on a lab VM.
+#   -n  dry run: print the coordinate commands (passwords masked), run nothing
+#
+# Hosts file: hosts.yml next to this script, or $UMDINATE_HOSTS. See hosts.example.yml.
+# Also overridable (mainly for tests): $UMDINATE_ROOT, $UMDINATE_COORDINATE.
+# This runs on your own machine, not on the targets, so the strict POSIX rules
+# in CLAUDE.md for target scripts are followed but the "no options" rule is not.
+
+DIR="$(cd "$(dirname "$0")" && pwd)"
+BASE="${UMDINATE_ROOT:-$DIR}"          # service and step paths are relative to this (linux/)
+HOSTS="${UMDINATE_HOSTS:-$DIR/hosts.yml}"
+US="$(printf '\037')"   # field separator that cannot appear in a password by accident
+
+usage() {
+  echo "usage: $0 -t <host|h1,h2|all> <playbook> [-r] [-n]" >&2
+  echo "       $0 -l   (list playbooks)" >&2
+  echo "  -r  harden mode (root via sudo); default is audit mode" >&2
+  echo "  -n  dry run, print coordinate commands only" >&2
+  exit 2
+}
+die() { echo "umdinate: $*" >&2; exit 1; }
+
+# ---- arguments --------------------------------------------------------------
+TARGETS=""
+SERVICE=""
+ROOT=0
+DRY=0
+LIST=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -t) [ $# -ge 2 ] || usage; TARGETS="$2"; shift 2 ;;
+    -r) ROOT=1; shift ;;
+    -n) DRY=1; shift ;;
+    -l) LIST=1; shift ;;
+    -h | --help) usage ;;
+    -*) echo "umdinate: unknown flag $1" >&2; usage ;;
+    *) [ -z "$SERVICE" ] || usage; SERVICE="$1"; shift ;;
+  esac
+done
+
+# One line per playbook: name, then its description: line
+list_playbooks() {
+  for f in "$BASE"/playbooks/*.yml; do
+    [ -f "$f" ] || continue
+    n="$(basename "$f" .yml)"
+    d="$(sed -n 's/^description:[[:space:]]*//p' "$f" | head -n 1)"
+    printf '  %-18s %s\n' "$n" "$d"
+  done
+}
+if [ "$LIST" = 1 ]; then list_playbooks; exit 0; fi
+
+if [ -z "$TARGETS" ] || [ -z "$SERVICE" ]; then usage; fi
+if [ "$ROOT" = 1 ]; then MODE=harden; else MODE=audit; fi
+
+COORD="${UMDINATE_COORDINATE:-$DIR/coordinate}"
+if [ ! -x "$COORD" ]; then
+  COORD="$(command -v coordinate 2>/dev/null)" || die "coordinate not found next to $0 or in PATH"
+fi
+[ -f "$HOSTS" ] || die "hosts file $HOSTS not found (copy hosts.example.yml to hosts.yml)"
+
+# ---- temp dir and cleanup ---------------------------------------------------
+WORK="$(mktemp -d 2>/dev/null)" || {
+  WORK="/tmp/umdinate.$$"
+  mkdir "$WORK" || die "cannot create a temp dir"
+}
+PIDS=""
+cleanup() {
+  for p in $PIDS; do kill "$p" 2>/dev/null; done
+  rm -rf "$WORK"
+}
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
+
+# ---- parse the hosts file ---------------------------------------------------
+# Output: name US ip US user US password US port US key US su_password
+# Accepts only "hosts:", comments and "- key: value" / "  key: value" lines.
+awk -v US="$US" '
+function flush() {
+  if (have) {
+    if (ip == "" || user == "") { print "hosts file: entry ending before line " NR " needs ip and user" > "/dev/stderr"; bad = 1 }
+    # coordinate splits -p on commas and would try each half as a password
+    if (pass ~ /,/) { print "hosts file: the password of " name " has a comma, coordinate cannot pass it" > "/dev/stderr"; bad = 1 }
+    print name US ip US user US pass US port US key US su
+  }
+  name = ip = user = pass = port = key = su = ""; have = 0
+}
+function clean(v) {
+  sub(/^[ \t]+/, "", v); sub(/[ \t\r]+$/, "", v)
+  if (v ~ /^"/) { sub(/^"/, "", v); sub(/".*$/, "", v); return v }
+  if (v ~ /^\047/) { sub(/^\047/, "", v); sub(/\047.*$/, "", v); return v }
+  sub(/[ \t]+#.*$/, "", v)
+  return v
+}
+/^[ \t]*#/ || /^[ \t\r]*$/ { next }
+/^hosts:[ \t\r]*$/ { next }
+{
+  line = $0
+  if (line ~ /^[ \t]*-[ \t]/) { flush(); sub(/^[ \t]*-[ \t]+/, "", line); have = 1 }
+  else if (line !~ /^[ \t]+[A-Za-z_]+:/) { print "hosts file: cannot parse line " NR ": " $0 > "/dev/stderr"; bad = 1; next }
+  sub(/^[ \t]+/, "", line)
+  key_ = line; sub(/:.*$/, "", key_)
+  val = line; sub(/^[^:]*:/, "", val); val = clean(val)
+  if (key_ == "name") name = val
+  else if (key_ == "ip") ip = val
+  else if (key_ == "user") user = val
+  else if (key_ == "password") pass = val
+  else if (key_ == "port") port = val
+  else if (key_ == "key") key = val
+  else if (key_ == "su_password") su = val
+  else { print "hosts file: unknown key \"" key_ "\" on line " NR > "/dev/stderr"; bad = 1 }
+}
+END { flush(); exit bad }
+' "$HOSTS" >"$WORK/hosts.all" || die "fix $HOSTS and retry"
+[ -s "$WORK/hosts.all" ] || die "no hosts in $HOSTS"
+
+# ---- pick the requested hosts -----------------------------------------------
+: >"$WORK/hosts.sel"
+OLDIFS="$IFS"
+IFS=','
+for t in $TARGETS; do
+  IFS="$OLDIFS"
+  if [ "$t" = all ]; then
+    cat "$WORK/hosts.all" >>"$WORK/hosts.sel"
+    continue
+  fi
+  awk -F "$US" -v t="$t" '$1 == t || $2 == t' "$WORK/hosts.all" >"$WORK/hit"
+  if [ ! -s "$WORK/hit" ]; then
+    echo "umdinate: unknown target '$t'. Known:" >&2
+    awk -F "$US" '{ printf "  %s (%s)\n", $1, $2 }' "$WORK/hosts.all" >&2
+    exit 1
+  fi
+  cat "$WORK/hit" >>"$WORK/hosts.sel"
+done
+IFS="$OLDIFS"
+# One line per host even if it was named twice
+awk '!seen[$0]++' "$WORK/hosts.sel" >"$WORK/hosts.uniq"
+
+# ---- load the service (and any services it includes) -------------------------
+# "run: services/ssh-harden" (a script path from linux/) means services/ssh-harden.<status>.sh, so promoting a script
+# (git mv to a new suffix) does not break the services that use it. Sets RESOLVED.
+resolve_script() {
+  set -- "$1" "$BASE/$1".*.sh
+  if [ $# != 2 ] || [ ! -f "$2" ]; then
+    die "step 'run: $1' must match exactly one file $BASE/$1.<status>.sh"
+  fi
+  RESOLVED="${2#"$BASE"/}"
+}
+
+# Output: kind US value US only US on_fail US timeout, one line per step.
+load_service() {
+  name="$1"
+  case " $STACK " in
+    *" $name "*) die "service '$name' includes itself (via: $STACK)" ;;
+  esac
+  STACK="$STACK $name"
+  file="$BASE/playbooks/$name.yml"
+  if [ ! -f "$file" ]; then
+    echo "umdinate: no playbook '$name'. Available:" >&2
+    list_playbooks >&2
+    exit 1
+  fi
+  awk -v US="$US" -v f="$file" '
+  function flush() {
+    if (kind != "") {
+      if (only == "") only = "both"
+      if (only != "both" && only != "harden" && only != "audit") { print f ": bad only: " only > "/dev/stderr"; bad = 1 }
+      print kind US val US only US onfail US tmo
+    }
+    kind = val = only = onfail = tmo = ""
+  }
+  function clean(v) {
+    sub(/^[ \t]+/, "", v); sub(/[ \t\r]+$/, "", v)
+    if (v ~ /^"/) { sub(/^"/, "", v); sub(/"[ \t]*$/, "", v); return v }
+    if (v ~ /^\047/) { sub(/^\047/, "", v); sub(/\047[ \t]*$/, "", v); return v }
+    sub(/[ \t]+#.*$/, "", v)
+    return v
+  }
+  /^[ \t]*#/ || /^[ \t\r]*$/ { next }
+  /^(service|description):/ { next }
+  /^steps:[ \t\r]*$/ { insteps = 1; next }
+  insteps {
+    line = $0
+    if (line ~ /^[ \t]*-[ \t]/) { flush(); sub(/^[ \t]*-[ \t]+/, "", line) }
+    else if (line !~ /^[ \t]+[A-Za-z_]+:/) { print f ": cannot parse line " NR ": " $0 > "/dev/stderr"; bad = 1; next }
+    sub(/^[ \t]+/, "", line)
+    k = line; sub(/:.*$/, "", k)
+    v = line; sub(/^[^:]*:/, "", v); v = clean(v)
+    if (k == "run" || k == "check" || k == "service") { kind = k; val = v }
+    else if (k == "only") only = v
+    else if (k == "on_fail") onfail = v
+    else if (k == "timeout") tmo = v
+    else { print f ": unknown key \"" k "\" on line " NR > "/dev/stderr"; bad = 1 }
+  }
+  END { flush(); exit bad }
+  ' "$file" >"$WORK/svc.$(echo "$name" | tr / _)" || die "fix $file and retry"
+  # Expand included services in place
+  while IFS="$US" read -r kind val only onfail tmo; do
+    if [ "$kind" = service ]; then
+      load_service "$val"
+    else
+      if [ "$kind" = run ]; then
+        resolve_script "$val"
+        val="$RESOLVED"
+      fi
+      printf '%s%s%s%s%s%s%s%s%s\n' "$kind" "$US" "$val" "$US" "$only" "$US" "$onfail" "$US" "$tmo" >>"$WORK/steps"
+    fi
+  done <"$WORK/svc.$(echo "$name" | tr / _)"
+}
+STACK=""
+: >"$WORK/steps"
+load_service "$SERVICE"
+[ -s "$WORK/steps" ] || die "service '$SERVICE' has no steps"
+
+# The status suffix decides what may run as root (see the table in README.md)
+while IFS="$US" read -r kind val only _ _; do
+  [ "$kind" = run ] || continue
+  if [ "$MODE" != harden ] || [ "$only" = audit ]; then continue; fi
+  st="${val%.sh}"
+  case "${st##*.}" in
+    tested | stable) ;;
+    *)
+      [ "${UMDINATE_UNTESTED:-}" = 1 ] ||
+        die "$val is not tested or stable, so it does not run as root. On a lab VM: UMDINATE_UNTESTED=1 $0 ..."
+      echo "umdinate: UMDINATE_UNTESTED=1, running $val as root although it is ${st##*.}"
+      ;;
+  esac
+done <"$WORK/steps"
+
+# ---- group hosts that share credentials -------------------------------------
+# One group per host, so a slow host never holds up the others.
+# Output: group US name US ip US user US password US port US key US su
+awk -F "$US" -v US="$US" '{
+  k = $2 US $3 US $5
+  if (!(k in g)) g[k] = ++n
+  print g[k] US $0
+}' "$WORK/hosts.uniq" >"$WORK/hosts.grp"
+NGROUPS="$(awk -F "$US" '{ if ($1 > m) m = $1 } END { print m + 0 }' "$WORK/hosts.grp")"
+
+echo "umdinate: service=$SERVICE mode=$MODE hosts=$(wc -l <"$WORK/hosts.uniq" | tr -d ' ') parallel-groups=$NGROUPS"
+
+# ---- run one coordinate call ------------------------------------------------
+# run_coord IPS USER PASS PORT KEY SU SCRIPT TIMEOUT
+run_coord() {
+  c_ips="$1"; c_user="$2"; c_pass="$3"; c_port="$4"; c_key="$5"; c_su="$6"; c_script="$7"; c_tmo="$8"
+  set -- -t "$c_ips" -u "$c_user"
+  [ -n "$c_pass" ] && set -- "$@" -p "$c_pass"
+  [ -n "$c_port" ] && set -- "$@" -P "$c_port"
+  [ -n "$c_key" ] && set -- "$@" -k "$c_key"
+  [ -n "$c_tmo" ] && set -- "$@" -T "$c_tmo"
+  if [ "$ROOT" = 1 ]; then
+    set -- "$@" -S
+    [ -n "$c_su" ] && set -- "$@" -R "$c_su"
+  fi
+  set -- "$@" -q -y "$c_script"
+  if [ "$DRY" = 1 ]; then
+    printf '  coordinate'
+    prev=""
+    for a in "$@"; do
+      if [ "$prev" = -p ] || [ "$prev" = -R ]; then printf ' ****'; else printf ' %s' "$a"; fi
+      prev="$a"
+    done
+    printf '\n'
+    return 0
+  fi
+  # stdin is /dev/null so coordinate cannot swallow our step list or wait on a
+  # terminal. tee shows the output live; the exit code goes through a file.
+  echo "    ... coordinate running on $c_ips (up to ${c_tmo:-30}s per script, output follows)"
+  {
+    "$COORD" "$@" </dev/null 2>&1
+    echo $? >"$WORK/co.$gid.rc"
+  } | tee "$WORK/co.$gid.out"
+  return "$(cat "$WORK/co.$gid.rc")"
+}
+
+# Coordinate exits 0 even when a login, an escalation or a script timeout
+# failed, so also read its [ERROR and [CRIT lines (the script's own output is
+# never prefixed like that). Marks hosts named in such a line (or the whole
+# group, when it names no host) as failed and keeps the rest alive.
+# check_errors GID STEP LABEL
+check_errors() {
+  ce_gid="$1"; ce_n="$2"; ce_label="$3"
+  ce_esc="$(printf '\033')"
+  sed "s/${ce_esc}\[[0-9;]*m//g" "$WORK/co.$ce_gid.out" | grep -e '\[ERROR' -e '\[CRIT' >"$WORK/err.$ce_gid"
+  [ -s "$WORK/err.$ce_gid" ] || return 0
+  cut -d "$US" -f 2 "$WORK/alive.$ce_gid" >"$WORK/ips.$ce_gid"
+  cp "$WORK/alive.$ce_gid" "$WORK/was.$ce_gid"
+  : >"$WORK/alive.$ce_gid"
+  # Errors that name none of the alive hosts hit the whole group
+  if grep -v -F -f "$WORK/ips.$ce_gid" "$WORK/err.$ce_gid" >/dev/null 2>&1; then
+    ce_all=1
+  else
+    ce_all=0
+  fi
+  while IFS="$US" read -r hn hip; do
+    ce_line="$(grep -F "$hip" "$WORK/err.$ce_gid" | head -n 1)"
+    if [ "$ce_all" = 1 ] && [ -z "$ce_line" ]; then
+      ce_line="$(head -n 1 "$WORK/err.$ce_gid")"
+    fi
+    if [ -n "$ce_line" ]; then
+      echo "[!] $hn: step $ce_n ($ce_label) failed: $ce_line"
+      printf '%s%s%s%s%s%s%s\n' "$hn" "$US" "$hip" "$US" failed "$US" "step $ce_n: $ce_label failed" >>"$WORK/results"
+    else
+      printf '%s%s%s\n' "$hn" "$US" "$hip" >>"$WORK/alive.$ce_gid"
+    fi
+  done <"$WORK/was.$ce_gid"
+}
+
+# ---- run every step for one credential group --------------------------------
+# Prints to stdout (collected per group), appends "name US ip US status US detail"
+# lines to $WORK/results. A failed step stops the chain for the hosts it failed.
+run_group() {
+  gid="$1"
+  awk -F "$US" -v g="$gid" '$1 == g' "$WORK/hosts.grp" >"$WORK/grp.$gid"
+  # Credentials are the same for the whole group: take them from its first line
+  g_user="$(head -n 1 "$WORK/grp.$gid" | cut -d "$US" -f 4)"
+  g_pass="$(head -n 1 "$WORK/grp.$gid" | cut -d "$US" -f 5)"
+  g_port="$(head -n 1 "$WORK/grp.$gid" | cut -d "$US" -f 6)"
+  g_key="$(head -n 1 "$WORK/grp.$gid" | cut -d "$US" -f 7)"
+  g_su="$(head -n 1 "$WORK/grp.$gid" | cut -d "$US" -f 8)"
+  # Hosts still in the chain, one "name US ip" per line
+  cut -d "$US" -f 2,3 "$WORK/grp.$gid" >"$WORK/alive.$gid"
+
+  echo "---- group $gid: $(cut -d "$US" -f 2 "$WORK/grp.$gid" | tr '\n' ' ')(as $g_user)"
+  n=0
+  while IFS="$US" read -r kind val only onfail tmo; do
+    n=$((n + 1))
+    [ -s "$WORK/alive.$gid" ] || break
+    if [ "$only" != both ] && [ "$only" != "$MODE" ]; then
+      echo "[-] step $n ($kind $val): skipped, only runs in $only mode"
+      continue
+    fi
+    alive_ips="$(cut -d "$US" -f 2 "$WORK/alive.$gid" | tr '\n' ',' | sed 's/,$//')"
+    if [ "$kind" = run ]; then
+      echo "[>] step $n: run $val"
+      if [ "$MODE" = harden ]; then
+        # Show what the script says it will break before it does
+        awk '/^# risk:/ { print "    " $0 }
+             /WHAT STOPS WORKING/ { p = 1 }
+             p && /^#/ { print "    " $0; next }
+             p { p = 0 }' "$BASE/$val"
+      fi
+      run_coord "$alive_ips" "$g_user" "$g_pass" "$g_port" "$g_key" "$g_su" "$BASE/$val" "$tmo"
+      rc=$?
+      [ "$DRY" = 1 ] || check_errors "$gid" "$n" "run $val"
+      if [ "$rc" != 0 ]; then
+        echo "[!] step $n ($val): coordinate exited $rc, stopping this group"
+        while IFS="$US" read -r hn hip; do
+          printf '%s%s%s%s%s%s%s\n' "$hn" "$US" "$hip" "$US" failed "$US" "step $n: run $val (exit $rc)" >>"$WORK/results"
+        done <"$WORK/alive.$gid"
+        : >"$WORK/alive.$gid"
+      fi
+    else
+      # check: one coordinate call per host so the answer belongs to that host
+      echo "[>] step $n: check $val"
+      cp "$WORK/alive.$gid" "$WORK/todo.$gid"
+      : >"$WORK/alive.$gid"
+      printf '#!/bin/sh\n( %s ) >/dev/null 2>&1\necho "UMDINATE-CHECK-RC=$?"\n' "$val" >"$WORK/check.$gid.$n.sh"
+      while IFS="$US" read -r hn hip; do
+        if [ "$DRY" = 1 ]; then
+          run_coord "$hip" "$g_user" "$g_pass" "$g_port" "$g_key" "$g_su" "$WORK/check.$gid.$n.sh" "$tmo"
+          printf '%s%s%s\n' "$hn" "$US" "$hip" >>"$WORK/alive.$gid"
+          continue
+        fi
+        run_coord "$hip" "$g_user" "$g_pass" "$g_port" "$g_key" "$g_su" "$WORK/check.$gid.$n.sh" "$tmo" >"$WORK/chk.out" 2>&1
+        res="$(grep 'UMDINATE-CHECK-RC=' "$WORK/chk.out" | tail -n 1 | sed 's/^.*UMDINATE-CHECK-RC=//' | tr -d '\r ')"
+        if [ "$res" = 0 ]; then
+          echo "[+] $hn: check passed ($val)"
+          printf '%s%s%s\n' "$hn" "$US" "$hip" >>"$WORK/alive.$gid"
+        else
+          if [ -z "$res" ]; then
+            echo "[!] $hn: check gave no answer (login or sudo failed?):"
+            sed 's/^/    /' "$WORK/chk.out"
+          fi
+          echo "[!] $hn: ${onfail:-check failed: $val}"
+          printf '%s%s%s%s%s%s%s\n' "$hn" "$US" "$hip" "$US" failed "$US" "step $n: ${onfail:-check failed: $val}" >>"$WORK/results"
+        fi
+      done <"$WORK/todo.$gid"
+    fi
+  done <"$WORK/steps"
+  # Whoever is still alive finished every step
+  while IFS="$US" read -r hn hip; do
+    printf '%s%s%s%s%s%s%s\n' "$hn" "$US" "$hip" "$US" ok "$US" "all steps done" >>"$WORK/results"
+  done <"$WORK/alive.$gid"
+}
+
+# ---- run the groups in parallel ---------------------------------------------
+: >"$WORK/results"
+g=1
+while [ "$g" -le "$NGROUPS" ]; do
+  if [ "$NGROUPS" = 1 ]; then
+    # One group: run it right here so everything shows up live
+    run_group 1
+  else
+    (run_group "$g" >"$WORK/group.$g.log" 2>&1; touch "$WORK/done.$g") &
+    PIDS="$PIDS $!"
+  fi
+  g=$((g + 1))
+done
+if [ "$NGROUPS" -gt 1 ]; then
+  echo "umdinate: $NGROUPS groups running in parallel, each one's output is shown as it finishes"
+  printed=0
+  while [ "$printed" -lt "$NGROUPS" ]; do
+    g=1
+    while [ "$g" -le "$NGROUPS" ]; do
+      if [ -f "$WORK/done.$g" ] && [ ! -f "$WORK/shown.$g" ]; then
+        cat "$WORK/group.$g.log"
+        touch "$WORK/shown.$g"
+        printed=$((printed + 1))
+      fi
+      g=$((g + 1))
+    done
+    [ "$printed" -lt "$NGROUPS" ] && sleep 1
+  done
+fi
+PIDS=""
+
+# ---- report -----------------------------------------------------------------
+echo
+echo "== Result ($SERVICE, $MODE) =="
+if [ "$DRY" = 1 ]; then
+  echo "dry run: nothing was executed"
+  echo "SUMMARY: dry-run hosts=$(wc -l <"$WORK/hosts.uniq" | tr -d ' ')"
+  exit 0
+fi
+awk -F "$US" '{ printf "%-8s %-16s %-6s %s\n", $1, $2, $3, $4 }' "$WORK/results"
+TOTAL="$(wc -l <"$WORK/hosts.uniq" | tr -d ' ')"
+OKN="$(awk -F "$US" '$3 == "ok"' "$WORK/results" | wc -l | tr -d ' ')"
+FAILN="$(awk -F "$US" '$3 == "failed"' "$WORK/results" | wc -l | tr -d ' ')"
+echo "SUMMARY: hosts=$TOTAL ok=$OKN failed=$FAILN"
+[ "$FAILN" = 0 ] && [ "$OKN" = "$TOTAL" ]

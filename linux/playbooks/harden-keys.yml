@@ -1,0 +1,6 @@
+service: harden-keys
+description: Move keys out of the ssh directory and quarantine them.
+steps:
+  - run: services/ssh-keys
+    timeout: 120
+    only: harden

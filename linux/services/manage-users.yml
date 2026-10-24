@@ -1,0 +1,10 @@
+# The users controller reads this chain and supplies per-host plans, switches
+# SSH credentials, and performs the interactive deletion checkpoint.
+# Entry point: sh users/manage-users.draft.sh
+service: manage-users
+description: Inventory, verify a new admin login, rotate credentials, optionally remove selected accounts
+steps:
+  - run: users/user-inventory
+  - run: users/ensure-access
+  - run: users/change-credentials
+  - run: users/delete-users

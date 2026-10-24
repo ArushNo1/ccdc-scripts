@@ -1,0 +1,4 @@
+service: run-counter
+description: Just Prints some numbers. Used to check parallelism
+steps:
+  - run: testing/is-coord-parallel/just-count-up

@@ -1,0 +1,7 @@
+service: audit-ssh
+description: Read-only look at sshd and the hiding spots around it. Changes nothing; -r only lets it see more
+steps:
+  - run: services/ssh-audit
+    timeout: 120
+  - run: persistence/ssh-backdoors
+    timeout: 120

@@ -1,0 +1,14 @@
+service: harden-ssh
+description: Audit sshd; with -r also rewrite its config, prove a new login works, then move the keys aside
+steps:
+  - service: audit-ssh
+  - run: services/ssh-harden
+    timeout: 60
+  # A new login as root, with the hardened config still in force, cancels the
+  # auto-revert that ssh-harden armed. If this fails the chain stops here, the
+  # old config comes back by itself and no key has been touched.
+  - check: "PATH=$PATH:/usr/sbin:/sbin; sshd -T | grep '^pubkeyauthentication no' && touch /var/run/ccdc-ssh-ok"
+    only: harden
+    on_fail: "could not confirm the new sshd config as root: it reverts by itself 180s after the reload"
+  - run: services/ssh-keys
+    timeout: 60

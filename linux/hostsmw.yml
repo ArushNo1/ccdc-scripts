@@ -1,0 +1,21 @@
+hosts:
+  - name: rocky-ecom
+    ip: 172.20.240.10
+    user: sysadmin
+    password: Changeme1!
+  - name: ubuntu-email
+    ip: 172.20.240.15
+    user: sysadmin
+    password: Changeme1!
+  - name: debian-splunk
+    ip: 172.20.240.20
+    user: sysadmin
+    password: Changeme1!
+  - name: ubuntu-wkst
+    ip: CHANGEME_DHCP   # run `ip a` on the box, the sheet only says DHCP
+    user: sysadmin
+    password: Changeme1!
+  - name: kali
+    ip: 172.17.0.2
+    user: sysadmin
+    password: Changeme1!

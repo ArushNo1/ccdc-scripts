@@ -1,0 +1,6 @@
+service: restore-services
+description: Put back what the newest disable-services run changed
+steps:
+  - run: services/restore-services
+    timeout: 120
+    only: harden

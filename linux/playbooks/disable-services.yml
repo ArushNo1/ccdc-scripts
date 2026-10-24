@@ -1,0 +1,7 @@
+service: disable-services
+description: Audit, then stop and disable the services named in DENY of disable-services.sh (edit it first); -r needed to change anything
+steps:
+  - service: audit-services
+  - run: services/disable-services
+    timeout: 120
+    only: harden

@@ -1,0 +1,13 @@
+# Copy to hosts.yml (gitignored) for each competition.
+# One entry per machine. Only this simple shape is understood:
+# a list under "hosts:", flat "key: value" lines, "#" comments.
+hosts:
+  - name: web01
+    ip: 192.168.1.183
+    user: ubuntu
+    password: ubuntu
+    # optional: port: 2222   key: ~/.ssh/id_ed25519   su_password: rootpw
+  - name: db01
+    ip: 192.168.1.184
+    user: admin
+    password: "pass word with # and spaces"
