@@ -1,0 +1,8 @@
+
+# per-competition credentials
+hosts.yml
+
+# User workflow inputs and generated credentials
+users/hosts.tsv
+users/authorized.tsv
+users/results/
