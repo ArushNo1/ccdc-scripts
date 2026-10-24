@@ -136,3 +136,24 @@ Remove-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explo
 ---
 
 sqlcmd -E -S localhost -Q "ALTER SERVER ROLE [sysadmin] DROP MEMBER [\Everyone]; ALTER SERVER ROLE [sysadmin] DROP MEMBER [UNDERPRESSURE\Guest]; ALTER SERVER ROLE [sysadmin] DROP MEMBER [UNDERPRESSURE\jerry]; ALTER SERVER ROLE [sysadmin] DROP MEMBER [UNDERPRESSURE\agrapplernamedsam]; DROP LOGIN [\Everyone]; DROP LOGIN [UNDERPRESSURE\Guest]; DROP LOGIN [UNDERPRESSURE\jerry]; DROP LOGIN [UNDERPRESSURE\agrapplernamedsam];"
+
+
+
+
+
+
+# 1. CBS Reboot Pending
+Remove-Item -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending" -Recurse -Force -ErrorAction SilentlyContinue
+
+# 2. CBS Packages Pending
+Remove-Item -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\PackagesPending" -Recurse -Force -ErrorAction SilentlyContinue
+
+# 3. Windows Update Pending
+Remove-Item -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired" -Recurse -Force -ErrorAction SilentlyContinue
+
+# 4. Session Manager Pending File Renames
+Remove-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager" -Name "PendingFileRenameOperations" -Force -ErrorAction SilentlyContinue
+Remove-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager" -Name "PendingFileRenameOperations2" -Force -ErrorAction SilentlyContinue
+
+# 5. Server Manager Pending Flag
+Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\ServerManager" -Name "CurrentState" -Value 0 -Force -ErrorAction SilentlyContinue
