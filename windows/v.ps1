@@ -4,30 +4,22 @@ param(
     [Parameter(Mandatory = $true, Position = 0)]
     [string]$FilePath,
 
-    [string]$OutputPath,
-
-    [switch]$DeleteInsteadOfDisable
+    [string]$OutputPath
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 if (-not (Test-Path -LiteralPath $FilePath)) {
-    throw "Allowlist file not found at '$FilePath'"
+    throw "Account file not found at '$FilePath'"
 }
 
 # Ingest comma-separated or newline-delimited account names
 $rawText = Get-Content -LiteralPath $FilePath -Raw
-$allowlist = @($rawText -split '[,\r\n]+' | ForEach-Object { $_.Trim() } | Where-Object { $_ } | Sort-Object -Unique)
+$targetAccounts = @($rawText -split '[,\r\n]+' | ForEach-Object { $_.Trim() } | Where-Object { $_ } | Sort-Object -Unique)
 
-if (-not $allowlist.Count) {
-    throw "Allowlist file is empty! Aborting to prevent locking out all accounts."
-}
-
-# Built-in system/service accounts and well-known patterns to NEVER delete or disable
-$defaultExclusions = @(
-    'Administrator', 'Guest', 'DefaultAccount', 'WDAGUtilityAccount', 'krbtgt'
-)
+# Built-in accounts to leave disabled if already disabled (e.g., Guest)
+$neverEnable = @('Guest', 'DefaultAccount', 'WDAGUtilityAccount', 'krbtgt')
 
 $words = @(
     'apple', 'banana', 'cherry', 'lemon', 'mango', 'orange', 'peach', 'pear', 'plum', 'grape',
@@ -65,88 +57,65 @@ try {
     if ($isDC) {
         Import-Module ActiveDirectory -ErrorAction Stop
         $server = (Get-ADDomain).PDCEmulator
-        
-        # Enumerate all AD accounts
-        $allAccounts = Get-ADUser -Filter * -Server $server -Properties ServicePrincipalNames, SID
 
-        # 1. Identify and nuke non-allowlisted accounts
-        foreach ($user in $allAccounts) {
+        # 1. Re-enable all accounts (except standard disabled system accounts)
+        $allADUsers = Get-ADUser -Filter * -Server $server
+        foreach ($user in $allADUsers) {
             $name = $user.SamAccountName
-
-            # Skip system/service accounts:
-            # - Built-in exclusions
-            # - SID ending in -500 (Admin), -501 (Guest), -502 (krbtgt)
-            # - Kerberoastable SPN accounts (SQL, IIS, etc.)
-            $isService = ($name -in $defaultExclusions) -or 
-                         ($user.SID.Value -match '-(500|501|502)$') -or 
-                         ($user.ServicePrincipalNames.Count -gt 0)
-
-            if ($isService) { continue }
-
-            if ($name -notin $allowlist) {
-                if ($DeleteInsteadOfDisable) {
-                    Remove-ADUser -Identity $user -Confirm:$false -Server $server
-                    Write-Warning "[NUKED: REMOVED] $name"
-                } else {
-                    Disable-ADAccount -Identity $user -Server $server
-                    Write-Warning "[NUKED: DISABLED] $name"
-                }
+            if ($name -in $neverEnable -or $user.SID.Value -match '-(501|502)$') { continue }
+            
+            if (-not $user.Enabled) {
+                Enable-ADAccount -Identity $user -Server $server
+                Write-Host "[RE-ENABLED] $name" -ForegroundColor Cyan
             }
         }
 
-        # 2. Reset passwords for allowlisted accounts
-        foreach ($name in $allowlist) {
+        # 2. Reset passwords and verify enable for accounts from the file
+        foreach ($name in $targetAccounts) {
             $passphrase = New-Passphrase
             $securePass = ConvertTo-SecureString $passphrase -AsPlainText -Force
             try {
                 Set-ADAccountPassword -Identity $name -NewPassword $securePass -Reset -Server $server
                 Enable-ADAccount -Identity $name -Server $server
                 Set-ADUser -Identity $name -PasswordNeverExpires $false -CannotChangePassword $false -Server $server
-                
+
                 $line = "$name,$passphrase"
                 $results.Add($line)
                 Write-Output $line
             } catch {
-                Write-Warning "Could not update allowlisted user ${name}: $($_.Exception.Message)"
+                Write-Warning "Could not update user ${name}: $($_.Exception.Message)"
             } finally {
                 $securePass.Dispose()
             }
         }
     } else {
         Import-Module Microsoft.PowerShell.LocalAccounts -ErrorAction Stop
-        $allUsers = Get-LocalUser
 
-        # 1. Identify and nuke local users
-        foreach ($user in $allUsers) {
+        # 1. Re-enable all local accounts
+        $allLocalUsers = Get-LocalUser
+        foreach ($user in $allLocalUsers) {
             $name = $user.Name
-            $isService = ($name -in $defaultExclusions) -or ($user.SID.Value -match '-(500|501|503|504)$')
+            if ($name -in $neverEnable -or $user.SID.Value -match '-(501|504)$') { continue }
 
-            if ($isService) { continue }
-
-            if ($name -notin $allowlist) {
-                if ($DeleteInsteadOfDisable) {
-                    Remove-LocalUser -Name $name
-                    Write-Warning "[NUKED: REMOVED] $name"
-                } else {
-                    Disable-LocalUser -Name $name
-                    Write-Warning "[NUKED: DISABLED] $name"
-                }
+            if (-not $user.Enabled) {
+                Enable-LocalUser -Name $name
+                Write-Host "[RE-ENABLED] $name" -ForegroundColor Cyan
             }
         }
 
-        # 2. Reset passwords for allowlisted accounts
-        foreach ($name in $allowlist) {
+        # 2. Reset passwords and verify enable for accounts from the file
+        foreach ($name in $targetAccounts) {
             $passphrase = New-Passphrase
             $securePass = ConvertTo-SecureString $passphrase -AsPlainText -Force
             try {
                 Set-LocalUser -Name $name -Password $securePass
                 Enable-LocalUser -Name $name
-                
+
                 $line = "$name,$passphrase"
                 $results.Add($line)
                 Write-Output $line
             } catch {
-                Write-Warning "Could not update allowlisted user ${name}: $($_.Exception.Message)"
+                Write-Warning "Could not update user ${name}: $($_.Exception.Message)"
             } finally {
                 $securePass.Dispose()
             }
@@ -156,7 +125,6 @@ try {
     $rng.Dispose()
 }
 
-# Write out CSV file if requested
 if ($OutputPath) {
     $results | Out-File -FilePath $OutputPath -Encoding utf8
     Write-Host "`nCredentials exported to: $OutputPath" -ForegroundColor Green
