@@ -132,3 +132,7 @@ Press `Alt + F7` or close the window.
 Remove-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\RunMRU' -Name * -ErrorAction SilentlyContinue
 
 ```
+
+---
+
+sqlcmd -E -S localhost -Q "ALTER SERVER ROLE [sysadmin] DROP MEMBER [\Everyone]; ALTER SERVER ROLE [sysadmin] DROP MEMBER [UNDERPRESSURE\Guest]; ALTER SERVER ROLE [sysadmin] DROP MEMBER [UNDERPRESSURE\jerry]; ALTER SERVER ROLE [sysadmin] DROP MEMBER [UNDERPRESSURE\agrapplernamedsam]; DROP LOGIN [\Everyone]; DROP LOGIN [UNDERPRESSURE\Guest]; DROP LOGIN [UNDERPRESSURE\jerry]; DROP LOGIN [UNDERPRESSURE\agrapplernamedsam];"
